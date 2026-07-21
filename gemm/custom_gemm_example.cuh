@@ -137,16 +137,18 @@ inline void tiled_gemm(int M, int N, int K,
 // ---------------------------------------------------------------------------
 
 // 输入的blockDim是固定的数值 (256 / 8) ^ 2 = 32 ^ 2 = 1024
-template <uint32_t coarsing_fator=8, uint32_t tile_size = 256, uint32_t step_size = 8, uint32_t block_size = 1024>
+template <uint32_t tile_size = 128, uint32_t block_size_xy = 32, uint32_t step_size = 8>
 __global__ void coarse_tiled_gemm_kernel(
     int M, int N, int K,
     float alpha, const float *A, int lda,
     const float *B, int ldb,
     float beta, float *C, int ldc) {
+    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+    constexpr uint32_t block_size = block_size_xy * block_size_xy;
+
     float C_temp[coarsing_fator][coarsing_fator] = {0};
 
     const uint32_t steps = (K + step_size - 1) / step_size;
-    constexpr uint32_t block_size_xy = tile_size / coarsing_fator;
 
     __shared__ float Ads[tile_size][step_size];
     __shared__ float Bds[step_size][tile_size];
@@ -238,3 +240,41 @@ __global__ void coarse_tiled_gemm_kernel(
     }
 }
 
+inline void coarse_tiled_gemm(int M, int N, int K,
+                       float alpha,
+                       const float *A, int lda,
+                       const float *B, int ldb,
+                       float beta,
+                       float *C, int ldc)
+{
+    
+    // TILE_SIZE   32->256
+    if (M < 64) {
+        constexpr uint32_t tile_size = 32;
+        constexpr uint32_t block_size_xy = 16;
+
+        dim3 block(block_size_xy * block_size_xy);
+        dim3 grid((N + tile_size - 1) / tile_size,
+                (M + tile_size - 1) / tile_size);
+        coarse_tiled_gemm_kernel<tile_size, block_size_xy><<<grid, block>>>(
+            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    } else if (M > 64 && M < 128) {
+        constexpr uint32_t tile_size = 64;
+        constexpr uint32_t block_size_xy = 16;
+
+        dim3 block(block_size_xy * block_size_xy);
+        dim3 grid((N + tile_size - 1) / tile_size,
+                (M + tile_size - 1) / tile_size);
+        coarse_tiled_gemm_kernel<tile_size, block_size_xy><<<grid, block>>>(
+            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    } else {
+        constexpr uint32_t tile_size = 128;
+        constexpr uint32_t block_size_xy = 32;
+
+        dim3 block(block_size_xy * block_size_xy);
+        dim3 grid((N + tile_size - 1) / tile_size,
+                (M + tile_size - 1) / tile_size);
+        coarse_tiled_gemm_kernel<<<grid, block>>>(
+            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    }
+}
