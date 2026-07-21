@@ -1,12 +1,13 @@
 // ============================================================================
 // GEMM 基准测试 —— 入口
 // ============================================================================
-// 编译（以 SM 8.0 / A100 为例，根据你的 GPU 调整 arch）：
-//   nvcc -arch=sm_80 -O3 -lcublas -o gemm_bench main.cu gemm_test.cu
+// 使用 CMake 构建（默认 Release + sm_120 / RTX 5090）：
+//   cmake -B build
+//   cmake --build build -j
+//   ./build/gemm_bench
 //
-// 或使用附带的 Makefile：
-//   make
-//   make run
+// 指定其他 GPU 架构（如 A100 / sm_80）：
+//   cmake -B build -DCMAKE_CUDA_ARCHITECTURES=80
 // ============================================================================
 
 #include "gemm_test.h"
