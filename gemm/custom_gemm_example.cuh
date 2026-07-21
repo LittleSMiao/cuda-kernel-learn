@@ -135,3 +135,106 @@ inline void tiled_gemm(int M, int N, int K,
 //   2. 写一个 inline launch 函数
 //   3. 在 main.cu 中注册到 impls 数组
 // ---------------------------------------------------------------------------
+
+// 输入的blockDim是固定的数值 (256 / 8) ^ 2 = 32 ^ 2 = 1024
+template <uint32_t coarsing_fator=8, uint32_t tile_size = 256, uint32_t step_size = 8, uint32_t block_size = 1024>
+__global__ void coarse_tiled_gemm_kernel(
+    int M, int N, int K,
+    float alpha, const float *A, int lda,
+    const float *B, int ldb,
+    float beta, float *C, int ldc) {
+    float C_temp[coarsing_fator][coarsing_fator] = {0};
+
+    const uint32_t steps = (K + step_size - 1) / step_size;
+    constexpr uint32_t block_size_xy = tile_size / coarsing_fator;
+
+    __shared__ float Ads[tile_size][step_size];
+    __shared__ float Bds[step_size][tile_size];
+
+    uint32_t laneId = threadIdx.x & (warpSize - 1);
+
+    for (uint32_t step = 0; step < steps; ++step) {
+        // 加载 A
+        // 使用 (4, 8) 的 warp 进行加载
+        uint32_t A_start_y = blockIdx.y * tile_size;
+   
+#if 1
+        // 直接使用threadIdx的思维进行加载
+#pragma unroll
+        for (uint32_t i = 0; i < tile_size * step_size; i += block_size) {
+            uint32_t temp_thread = i + threadIdx.x;
+            uint32_t thread_load_y = temp_thread / step_size;
+            uint32_t thread_load_x = temp_thread & (step_size - 1);
+
+            // 这个地方不太好，一会调整下
+            if (A_start_y + thread_load_y < M && thread_load_x + step * step_size < K) {
+                Ads[thread_load_y][thread_load_x] = A[(A_start_y + thread_load_y) + (thread_load_x + step * step_size) * lda];
+            } else {
+                Ads[thread_load_y][thread_load_x] = 0;
+            }
+        }
+#else
+        // 将warp进行reshape然后进行加载
+        constexpr uint32_t warp_stride_x = step_size;
+        constexpr uint32_t warp_stride_y = warpSize / step_size;
+        constexpr uint32_t block_size_y = tile_size / warp_stride_y; // y维度的warp数量
+#pragma unroll
+        for (uint32_t i = 0; i < (tile_size * step_size + blockSize - 1) / blockSize; ++i) {
+            uint32_t warpId = threadIdx.x / warpSize; // 先得到线性的 warpId
+            uint32_t loaded_a_y = warpId * warp_stride_y + threadIdx.x / warp_stride_x;
+            uint32_t loaded_a_x = threadIdx.x % warp_stride_x + step_size * step;
+            Ads[loaded_a_y][loaded_a_x] = A[A_start_y + loaded_a_y + loaded_a_x * K];
+        }
+#endif
+        // 加载 B
+        // 使用(32, 1) 的 warp 进行加载
+        uint32_t B_start_x = blockIdx.x * tile_size;
+#pragma unroll
+        for (uint32_t i = 0; i < tile_size * step_size; i += block_size) {
+            uint32_t temp_thread = i + threadIdx.x;
+            uint32_t thread_load_y = temp_thread / tile_size;
+            uint32_t thread_load_x = temp_thread & (tile_size - 1);
+
+            if (step * step_size + thread_load_y < K && B_start_x + thread_load_x < N) {
+                Bds[thread_load_y][thread_load_x] = B[(step * step_size + thread_load_y) + (B_start_x + thread_load_x) * ldb];
+            } else {
+                Bds[thread_load_y][thread_load_x] = 0;
+            }
+        }
+
+        __syncthreads();
+
+#pragma unroll
+        for (uint32_t p = 0; p < step_size; ++p) {
+#pragma unroll
+            for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+                uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
+#pragma unroll
+                for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+                    uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
+
+                    C_temp[c_i][c_j] += Ads[c_row][p] * Bds[p][c_col];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+        uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
+        uint32_t c_global_row = blockIdx.y * tile_size + c_row;
+#pragma unroll
+        for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+            uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
+            uint32_t c_global_col = blockIdx.x * tile_size + c_col;
+
+            if (c_global_row < M && c_global_col < N) {
+                uint32_t idx = c_global_row + c_global_col * ldc;
+                C[idx] = alpha * C_temp[c_i][c_j] + beta * C[idx];
+            }
+        }
+    }
+}
+
