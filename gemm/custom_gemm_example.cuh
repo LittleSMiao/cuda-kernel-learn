@@ -153,8 +153,6 @@ __global__ void coarse_tiled_gemm_kernel(
     __shared__ float Ads[tile_size][step_size];
     __shared__ float Bds[step_size][tile_size];
 
-    uint32_t laneId = threadIdx.x & (warpSize - 1);
-
     for (uint32_t step = 0; step < steps; ++step) {
         // 加载 A
         // 使用 (4, 8) 的 warp 进行加载
@@ -163,12 +161,10 @@ __global__ void coarse_tiled_gemm_kernel(
 #if 1
         // 直接使用threadIdx的思维进行加载
 #pragma unroll
-        for (uint32_t i = 0; i < tile_size * step_size; i += block_size) {
-            uint32_t temp_thread = i + threadIdx.x;
-            uint32_t thread_load_y = temp_thread / step_size;
-            uint32_t thread_load_x = temp_thread & (step_size - 1);
+        for (uint32_t i = threadIdx.x; i < tile_size * step_size; i += blockDim.x) {
+            uint32_t thread_load_y = i / step_size;
+            uint32_t thread_load_x = i - thread_load_y * step_size;
 
-            // 这个地方不太好，一会调整下
             if (A_start_y + thread_load_y < M && thread_load_x + step * step_size < K) {
                 Ads[thread_load_y][thread_load_x] = A[(A_start_y + thread_load_y) + (thread_load_x + step * step_size) * lda];
             } else {
@@ -192,10 +188,9 @@ __global__ void coarse_tiled_gemm_kernel(
         // 使用(32, 1) 的 warp 进行加载
         uint32_t B_start_x = blockIdx.x * tile_size;
 #pragma unroll
-        for (uint32_t i = 0; i < tile_size * step_size; i += block_size) {
-            uint32_t temp_thread = i + threadIdx.x;
-            uint32_t thread_load_y = temp_thread / tile_size;
-            uint32_t thread_load_x = temp_thread & (tile_size - 1);
+        for (uint32_t i = threadIdx.x; i < step_size * tile_size; i += blockDim.x) {
+            uint32_t thread_load_y = i / tile_size;
+            uint32_t thread_load_x = i - thread_load_y * tile_size;
 
             if (step * step_size + thread_load_y < K && B_start_x + thread_load_x < N) {
                 Bds[thread_load_y][thread_load_x] = B[(step * step_size + thread_load_y) + (B_start_x + thread_load_x) * ldb];
@@ -248,33 +243,35 @@ inline void coarse_tiled_gemm(int M, int N, int K,
                        float *C, int ldc)
 {
     
-    // TILE_SIZE   32->256
-    if (M < 64) {
-        constexpr uint32_t tile_size = 32;
+    const uint32_t max_dim = max(M, N);
+
+    // 按问题规模分派：小块多用 tile 换更多 block 提高 SM 利用率
+    if (max_dim <= 64) {
+        constexpr uint32_t tile_size     = 32;
         constexpr uint32_t block_size_xy = 16;
 
         dim3 block(block_size_xy * block_size_xy);
         dim3 grid((N + tile_size - 1) / tile_size,
-                (M + tile_size - 1) / tile_size);
-        coarse_tiled_gemm_kernel<tile_size, block_size_xy><<<grid, block>>>(
+                  (M + tile_size - 1) / tile_size);
+        coarse_tiled_gemm_kernel<tile_size, block_size_xy, 8><<<grid, block>>>(
             M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-    } else if (M > 64 && M < 128) {
-        constexpr uint32_t tile_size = 64;
+    } else if (max_dim <= 128) {
+        constexpr uint32_t tile_size     = 64;
         constexpr uint32_t block_size_xy = 16;
 
         dim3 block(block_size_xy * block_size_xy);
         dim3 grid((N + tile_size - 1) / tile_size,
-                (M + tile_size - 1) / tile_size);
-        coarse_tiled_gemm_kernel<tile_size, block_size_xy><<<grid, block>>>(
+                  (M + tile_size - 1) / tile_size);
+        coarse_tiled_gemm_kernel<tile_size, block_size_xy, 8><<<grid, block>>>(
             M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
     } else {
-        constexpr uint32_t tile_size = 128;
+        constexpr uint32_t tile_size     = 128;
         constexpr uint32_t block_size_xy = 32;
 
         dim3 block(block_size_xy * block_size_xy);
         dim3 grid((N + tile_size - 1) / tile_size,
-                (M + tile_size - 1) / tile_size);
-        coarse_tiled_gemm_kernel<<<grid, block>>>(
+                  (M + tile_size - 1) / tile_size);
+        coarse_tiled_gemm_kernel<tile_size, block_size_xy, 8><<<grid, block>>>(
             M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 }
