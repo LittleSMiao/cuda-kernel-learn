@@ -137,21 +137,20 @@ inline void tiled_gemm(int M, int N, int K,
 // ---------------------------------------------------------------------------
 
 // 输入的blockDim是固定的数值 (256 / 8) ^ 2 = 32 ^ 2 = 1024
-template <uint32_t coarsing_fator=8, uint32_t tile_size = 256, uint32_t step_size = 8, uint32_t block_size = 1024>
+template <uint32_t tile_size = 128, uint32_t block_size_xy = 32, uint32_t step_size = 8>
 __global__ void coarse_tiled_gemm_kernel(
     int M, int N, int K,
     float alpha, const float *A, int lda,
     const float *B, int ldb,
     float beta, float *C, int ldc) {
+    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+
     float C_temp[coarsing_fator][coarsing_fator] = {0};
 
     const uint32_t steps = (K + step_size - 1) / step_size;
-    constexpr uint32_t block_size_xy = tile_size / coarsing_fator;
 
     __shared__ float Ads[tile_size][step_size];
     __shared__ float Bds[step_size][tile_size];
-
-    uint32_t laneId = threadIdx.x & (warpSize - 1);
 
     for (uint32_t step = 0; step < steps; ++step) {
         // 加载 A
@@ -161,12 +160,10 @@ __global__ void coarse_tiled_gemm_kernel(
 #if 1
         // 直接使用threadIdx的思维进行加载
 #pragma unroll
-        for (uint32_t i = 0; i < tile_size * step_size; i += block_size) {
-            uint32_t temp_thread = i + threadIdx.x;
-            uint32_t thread_load_y = temp_thread / step_size;
-            uint32_t thread_load_x = temp_thread & (step_size - 1);
+        for (uint32_t i = threadIdx.x; i < tile_size * step_size; i += blockDim.x) {
+            uint32_t thread_load_y = i / step_size;
+            uint32_t thread_load_x = i - thread_load_y * step_size;
 
-            // 这个地方不太好，一会调整下
             if (A_start_y + thread_load_y < M && thread_load_x + step * step_size < K) {
                 Ads[thread_load_y][thread_load_x] = A[(A_start_y + thread_load_y) + (thread_load_x + step * step_size) * lda];
             } else {
@@ -190,10 +187,9 @@ __global__ void coarse_tiled_gemm_kernel(
         // 使用(32, 1) 的 warp 进行加载
         uint32_t B_start_x = blockIdx.x * tile_size;
 #pragma unroll
-        for (uint32_t i = 0; i < tile_size * step_size; i += block_size) {
-            uint32_t temp_thread = i + threadIdx.x;
-            uint32_t thread_load_y = temp_thread / tile_size;
-            uint32_t thread_load_x = temp_thread & (tile_size - 1);
+        for (uint32_t i = threadIdx.x; i < step_size * tile_size; i += blockDim.x) {
+            uint32_t thread_load_y = i / tile_size;
+            uint32_t thread_load_x = i - thread_load_y * tile_size;
 
             if (step * step_size + thread_load_y < K && B_start_x + thread_load_x < N) {
                 Bds[thread_load_y][thread_load_x] = B[(step * step_size + thread_load_y) + (B_start_x + thread_load_x) * ldb];
@@ -238,3 +234,37 @@ __global__ void coarse_tiled_gemm_kernel(
     }
 }
 
+inline void coarse_tiled_gemm(int M, int N, int K,
+                       float alpha,
+                       const float *A, int lda,
+                       const float *B, int ldb,
+                       float beta,
+                       float *C, int ldc)
+{
+    
+    const uint32_t max_dim = max(M, N);
+
+    // 按问题规模分派：小尺寸用更小的 tile 产生更多 block，提高 SM 利用率
+    if (max_dim <= 256) {
+        // 中等尺寸：64×64 tile，1024 thread，coarsing=2（4 regs）
+        // 256² → 16 blocks，128² → 4 blocks
+        constexpr uint32_t tile_size     = 64;
+        constexpr uint32_t block_size_xy = 32;
+
+        dim3 block(block_size_xy * block_size_xy);
+        dim3 grid((N + tile_size - 1) / tile_size,
+                  (M + tile_size - 1) / tile_size);
+        coarse_tiled_gemm_kernel<tile_size, block_size_xy, 8><<<grid, block>>>(
+            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    } else {
+        // 大尺寸：128×128 tile，1024 thread，coarsing=4（16 regs）
+        constexpr uint32_t tile_size     = 128;
+        constexpr uint32_t block_size_xy = 32;
+
+        dim3 block(block_size_xy * block_size_xy);
+        dim3 grid((N + tile_size - 1) / tile_size,
+                  (M + tile_size - 1) / tile_size);
+        coarse_tiled_gemm_kernel<tile_size, block_size_xy, 8><<<grid, block>>>(
+            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    }
+}
