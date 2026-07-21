@@ -78,6 +78,15 @@ struct TestConfig {
 // API
 // ---------------------------------------------------------------------------
 
+// cuBLAS baseline 实现（定义在 gemm_test.cu），可直接注册到 impls 数组。
+void cublas_gemm(
+    int M, int N, int K,
+    float alpha,
+    const float *A, int lda,
+    const float *B, int ldb,
+    float beta,
+    float *C, int ldc);
+
 // 运行完整的基准测试：以 cuBLAS 为 baseline，对所有注册的 GEMM 实现进行
 // 性能和正确性评测，返回综合报告。
 BenchmarkReport run_benchmark(

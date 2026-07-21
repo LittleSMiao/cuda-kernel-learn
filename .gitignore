@@ -1,0 +1,10 @@
+# CMake 构建产物
+build/
+gemm_bench
+
+# 旧构建产物 / 运行输出
+gemm_benchmark.csv
+*.qdrep
+*.sqlite
+*.nsys-rep
+*.o
