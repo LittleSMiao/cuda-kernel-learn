@@ -144,7 +144,6 @@ __global__ void coarse_tiled_gemm_kernel(
     const float *B, int ldb,
     float beta, float *C, int ldc) {
     constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
-    constexpr uint32_t block_size = block_size_xy * block_size_xy;
 
     float C_temp[coarsing_fator][coarsing_fator] = {0};
 
@@ -245,19 +244,12 @@ inline void coarse_tiled_gemm(int M, int N, int K,
     
     const uint32_t max_dim = max(M, N);
 
-    // 按问题规模分派：小块多用 tile 换更多 block 提高 SM 利用率
-    if (max_dim <= 64) {
-        constexpr uint32_t tile_size     = 32;
-        constexpr uint32_t block_size_xy = 16;
-
-        dim3 block(block_size_xy * block_size_xy);
-        dim3 grid((N + tile_size - 1) / tile_size,
-                  (M + tile_size - 1) / tile_size);
-        coarse_tiled_gemm_kernel<tile_size, block_size_xy, 8><<<grid, block>>>(
-            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-    } else if (max_dim <= 128) {
+    // 按问题规模分派：小尺寸用更小的 tile 产生更多 block，提高 SM 利用率
+    if (max_dim <= 256) {
+        // 中等尺寸：64×64 tile，1024 thread，coarsing=2（4 regs）
+        // 256² → 16 blocks，128² → 4 blocks
         constexpr uint32_t tile_size     = 64;
-        constexpr uint32_t block_size_xy = 16;
+        constexpr uint32_t block_size_xy = 32;
 
         dim3 block(block_size_xy * block_size_xy);
         dim3 grid((N + tile_size - 1) / tile_size,
@@ -265,6 +257,7 @@ inline void coarse_tiled_gemm(int M, int N, int K,
         coarse_tiled_gemm_kernel<tile_size, block_size_xy, 8><<<grid, block>>>(
             M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
     } else {
+        // 大尺寸：128×128 tile，1024 thread，coarsing=4（16 regs）
         constexpr uint32_t tile_size     = 128;
         constexpr uint32_t block_size_xy = 32;
 
