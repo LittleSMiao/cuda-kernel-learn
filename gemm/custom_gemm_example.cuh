@@ -144,7 +144,7 @@ __global__ void coarse_tiled_gemm_kernel(
     const float *B, int ldb,
     float beta, float *C, int ldc) {
     constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
-
+    constexpr uint32_t block_size = block_size_xy * block_size_xy;
     float C_temp[coarsing_fator][coarsing_fator] = {0};
 
     const uint32_t steps = (K + step_size - 1) / step_size;
@@ -159,15 +159,21 @@ __global__ void coarse_tiled_gemm_kernel(
    
 #if 1
         // 直接使用threadIdx的思维进行加载
+        // 这里的blockSize为 * 8
+        constexpr uint32_t tile_total_size = tile_size * step_size;
+        constexpr uint32_t block_size_y_tile_a = block_size / step_size;
 #pragma unroll
-        for (uint32_t i = threadIdx.x; i < tile_size * step_size; i += blockDim.x) {
-            uint32_t thread_load_y = i / step_size;
-            uint32_t thread_load_x = i - thread_load_y * step_size;
+        for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+            // 这个地方是相对tile的索引
+            uint32_t row = block_size_y_tile_a * b + threadIdx.x % block_size_y_tile_a;
+            uint32_t col = threadIdx.x / block_size_y_tile_a;
 
-            if (A_start_y + thread_load_y < M && thread_load_x + step * step_size < K) {
-                Ads[thread_load_y][thread_load_x] = A[(A_start_y + thread_load_y) + (thread_load_x + step * step_size) * lda];
-            } else {
-                Ads[thread_load_y][thread_load_x] = 0;
+            if (row < tile_size && col < step_size) {
+                if (A_start_y + row < M && col + step * step_size < K) {
+                    Ads[row][col] = A[(A_start_y + row) + (col + step * step_size) * lda];
+                } else {
+                    Ads[row][col] = 0;
+                }
             }
         }
 #else
@@ -186,15 +192,19 @@ __global__ void coarse_tiled_gemm_kernel(
         // 加载 B
         // 使用(32, 1) 的 warp 进行加载
         uint32_t B_start_x = blockIdx.x * tile_size;
+        constexpr uint32_t block_size_y_tile_b = step_size;
 #pragma unroll
-        for (uint32_t i = threadIdx.x; i < step_size * tile_size; i += blockDim.x) {
-            uint32_t thread_load_y = i / tile_size;
-            uint32_t thread_load_x = i - thread_load_y * tile_size;
+        for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+            // 这边也是在block中的索引，也就是在Bds中的索引
+            uint32_t row = threadIdx.x % block_size_y_tile_b;
+            uint32_t col = threadIdx.x / block_size_y_tile_b + b * (block_size / block_size_y_tile_b);
 
-            if (step * step_size + thread_load_y < K && B_start_x + thread_load_x < N) {
-                Bds[thread_load_y][thread_load_x] = B[(step * step_size + thread_load_y) + (B_start_x + thread_load_x) * ldb];
-            } else {
-                Bds[thread_load_y][thread_load_x] = 0;
+            if (row < step_size && col < tile_size) {
+                if (row + step * step_size < K && col + B_start_x < N) {
+                    Bds[row][col] = B[(row + step * step_size) + (col + B_start_x) * ldb];
+                } else {
+                    Bds[row][col] = 0;
+                }
             }
         }
 
@@ -248,6 +258,17 @@ inline void coarse_tiled_gemm(int M, int N, int K,
     if (max_dim <= 256) {
         // 中等尺寸：64×64 tile，1024 thread，coarsing=2（4 regs）
         // 256² → 16 blocks，128² → 4 blocks
+        constexpr uint32_t tile_size     = 16;
+        constexpr uint32_t block_size_xy = 16;
+        constexpr uint32_t step_size     = 16;
+
+        dim3 block(block_size_xy * block_size_xy);
+        dim3 grid((N + tile_size - 1) / tile_size,
+                  (M + tile_size - 1) / tile_size);
+        coarse_tiled_gemm_kernel<tile_size, block_size_xy, step_size><<<grid, block>>>(
+            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    } else if (max_dim < 1024) {
+        // 大尺寸：128×128 tile，1024 thread，coarsing=4（16 regs）
         constexpr uint32_t tile_size     = 64;
         constexpr uint32_t block_size_xy = 32;
 

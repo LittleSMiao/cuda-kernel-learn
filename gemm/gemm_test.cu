@@ -1,6 +1,7 @@
 #include "gemm_test.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -50,6 +51,7 @@ void init_matrix_col_major(float *h, int rows, int cols, int ld) {
 }
 
 static double get_gflops(int M, int N, int K, double time_ms) {
+    if (time_ms <= 0.0) return 0.0;
     double ops = 2.0 * M * N * K;  // 乘加算两次运算
     return ops / (time_ms * 1e6);  // ms → GFLOPS
 }
@@ -66,34 +68,59 @@ static GemmTestResult test_one(
     const float *d_C_ref,          // cuBLAS 参考结果
     const TestConfig &cfg)
 {
+    // 清除之前可能残留的 sticky error
+    cudaGetLastError();
+
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     float alpha = 1.0f, beta = 0.0f;
+    bool kernel_ok = true;
 
     // --- 预热 ---
-    for (int i = 0; i < cfg.warmup_iters; ++i) {
-        cudaMemset(d_C, 0, ldc * N * sizeof(float));
+    for (int i = 0; i < cfg.warmup_iters && kernel_ok; ++i) {
+        if (cudaMemset(d_C, 0, ldc * N * sizeof(float)) != cudaSuccess)
+            kernel_ok = false;
         desc.func(M, N, K, alpha, d_A, lda, d_B, ldb, beta, d_C, ldc);
     }
-    cudaDeviceSynchronize();
+    if (cudaDeviceSynchronize() != cudaSuccess) kernel_ok = false;
+    if (cudaGetLastError() != cudaSuccess) kernel_ok = false;
 
     // --- 正式计时 ---
-    float total_ms = 0.0f;
-    for (int i = 0; i < cfg.bench_iters; ++i) {
-        cudaMemset(d_C, 0, ldc * N * sizeof(float));
+    // 一次 memset + sync，然后多次 kernel launch 放在一对 event 之间，
+    // 累积足够的 GPU 时间以突破 timer 精度限制
+    using Clock = std::chrono::high_resolution_clock;
+    double avg_ms = 0.0;
 
-        cudaEventRecord(start);
-        desc.func(M, N, K, alpha, d_A, lda, d_B, ldb, beta, d_C, ldc);
-        cudaEventRecord(stop);
+    if (kernel_ok) {
+        if (cudaMemset(d_C, 0, ldc * N * sizeof(float)) != cudaSuccess)
+            kernel_ok = false;
+        if (cudaDeviceSynchronize() != cudaSuccess) kernel_ok = false;
 
-        cudaEventSynchronize(stop);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, start, stop);
-        total_ms += ms;
+        if (kernel_ok) {
+            auto t0 = Clock::now();
+
+            cudaEventRecord(start);
+            for (int i = 0; i < cfg.bench_iters; ++i) {
+                desc.func(M, N, K, alpha, d_A, lda, d_B, ldb, beta, d_C, ldc);
+            }
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+
+            auto t1 = Clock::now();
+            double cpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            float gpu_ms = 0.0f;
+            cudaEventElapsedTime(&gpu_ms, start, stop);
+
+            if (cudaGetLastError() != cudaSuccess) kernel_ok = false;
+
+            // 优先使用 GPU event 计时，若为 0 则回退到 CPU 计时
+            avg_ms = (gpu_ms > 0.0f) ? (gpu_ms / cfg.bench_iters)
+                                     : (cpu_ms / cfg.bench_iters);
+        }
     }
-    double avg_ms = total_ms / cfg.bench_iters;
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -102,31 +129,35 @@ static GemmTestResult test_one(
     double max_err = 0.0;
     bool   correct = true;
 
-    if (!cfg.skip_correctness) {
+    if (!cfg.skip_correctness && kernel_ok) {
         std::vector<float> h_C(ldc * N);
         std::vector<float> h_ref(ldc * N);
-        cudaMemcpy(h_C.data(),   d_C,     ldc * N * sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_ref.data(), d_C_ref, ldc * N * sizeof(float), cudaMemcpyDeviceToHost);
-
-        for (int j = 0; j < N; ++j) {
-            for (int i = 0; i < M; ++i) {
-                float ref  = h_ref[j * ldc + i];
-                float val  = h_C[j * ldc + i];
-                float diff = std::fabs(val - ref);
-                float denom = std::max(1.0f, std::fabs(ref));
-                if (diff > 1.0f && diff / denom > cfg.error_tol) {
-                    correct = false;
+        if (cudaMemcpy(h_C.data(),   d_C,     ldc * N * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(h_ref.data(), d_C_ref, ldc * N * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            correct = false;
+        } else {
+            for (int j = 0; j < N; ++j) {
+                for (int i = 0; i < M; ++i) {
+                    float ref  = h_ref[j * ldc + i];
+                    float val  = h_C[j * ldc + i];
+                    float diff = std::fabs(val - ref);
+                    float denom = std::max(1.0f, std::fabs(ref));
+                    if (diff > 1.0f && diff / denom > cfg.error_tol) {
+                        correct = false;
+                    }
+                    if (diff > max_err) max_err = diff;
                 }
-                if (diff > max_err) max_err = diff;
             }
         }
+    } else if (!kernel_ok) {
+        correct = false;
     }
 
     return {
         desc.name, M, N, K,
         avg_ms,
         get_gflops(M, N, K, avg_ms),
-        get_gflops(M, N, K, avg_ms),  // same as gflops for now
+        get_gflops(M, N, K, avg_ms),
         max_err,
         correct
     };
