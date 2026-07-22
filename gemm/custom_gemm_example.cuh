@@ -143,9 +143,9 @@ __global__ void coarse_tiled_gemm_kernel(
     float alpha, const float *A, int lda,
     const float *B, int ldb,
     float beta, float *C, int ldc) {
-    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+    constexpr uint32_t coarsing_factor = tile_size / block_size_xy;
     constexpr uint32_t block_size = block_size_xy * block_size_xy;
-    float C_temp[coarsing_fator][coarsing_fator] = {0};
+    float C_temp[coarsing_factor][coarsing_factor] = {0};
 
     const uint32_t steps = (K + step_size - 1) / step_size;
 
@@ -213,10 +213,10 @@ __global__ void coarse_tiled_gemm_kernel(
 #pragma unroll
         for (uint32_t p = 0; p < step_size; ++p) {
 #pragma unroll
-            for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+            for (uint32_t c_i = 0; c_i < coarsing_factor; ++c_i) {
                 uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
 #pragma unroll
-                for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+                for (uint32_t c_j = 0; c_j < coarsing_factor; ++c_j) {
                     uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
 
                     C_temp[c_i][c_j] += Ads[c_row][p] * Bds[p][c_col];
@@ -228,11 +228,11 @@ __global__ void coarse_tiled_gemm_kernel(
     }
 
 #pragma unroll
-    for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+    for (uint32_t c_i = 0; c_i < coarsing_factor; ++c_i) {
         uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
         uint32_t c_global_row = blockIdx.y * tile_size + c_row;
 #pragma unroll
-        for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+        for (uint32_t c_j = 0; c_j < coarsing_factor; ++c_j) {
             uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
             uint32_t c_global_col = blockIdx.x * tile_size + c_col;
 
@@ -244,47 +244,43 @@ __global__ void coarse_tiled_gemm_kernel(
     }
 }
 
-template <template <uint32_t, uint32_t, uint32_t> class Kernel>
-inline void launch_coarse_gemm(int M, int N, int K,
-                       float alpha,
-                       const float *A, int lda,
-                       const float *B, int ldb,
-                       float beta,
-                       float *C, int ldc)
-{
-
-    const uint32_t max_dim = max(M, N);
-
-    // 按问题规模分派：小尺寸用更小的 tile 产生更多 block，提高 SM 利用率
-    if (max_dim <= 256) {
-        constexpr uint32_t tile_size     = 16;
-        constexpr uint32_t block_size_xy = 16;
-        constexpr uint32_t step_size     = 16;
-
-        dim3 block(block_size_xy * block_size_xy);
-        dim3 grid((N + tile_size - 1) / tile_size,
-                  (M + tile_size - 1) / tile_size);
-        Kernel<tile_size, block_size_xy, step_size><<<grid, block>>>(
-            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-    } else if (max_dim < 1024) {
-        constexpr uint32_t tile_size     = 64;
-        constexpr uint32_t block_size_xy = 32;
-
-        dim3 block(block_size_xy * block_size_xy);
-        dim3 grid((N + tile_size - 1) / tile_size,
-                  (M + tile_size - 1) / tile_size);
-        Kernel<tile_size, block_size_xy, 8><<<grid, block>>>(
-            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-    } else {
-        constexpr uint32_t tile_size     = 128;
-        constexpr uint32_t block_size_xy = 32;
-
-        dim3 block(block_size_xy * block_size_xy);
-        dim3 grid((N + tile_size - 1) / tile_size,
-                  (M + tile_size - 1) / tile_size);
-        Kernel<tile_size, block_size_xy, 8><<<grid, block>>>(
-            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-    }
+// 使用宏来生成 launch 函数，避免 template-template parameter 在 nvcc 12.8 中
+// Kernel<args...><<<grid, block>>> 的解析问题。
+#define DEFINE_LAUNCH_COARSE_GEMM(launch_name, kernel_name)                   \
+inline void launch_name(int M, int N, int K,                                 \
+                       float alpha,                                          \
+                       const float *A, int lda,                              \
+                       const float *B, int ldb,                              \
+                       float beta,                                           \
+                       float *C, int ldc)                                    \
+{                                                                             \
+    const uint32_t max_dim = max(M, N);                                       \
+    if (max_dim <= 256) {                                                     \
+        constexpr uint32_t tile_size     = 16;                                \
+        constexpr uint32_t block_size_xy = 16;                                \
+        constexpr uint32_t step_size     = 16;                                \
+        dim3 blk(block_size_xy * block_size_xy);                              \
+        dim3 grd((N + tile_size - 1) / tile_size,                             \
+                 (M + tile_size - 1) / tile_size);                            \
+        kernel_name<tile_size, block_size_xy, step_size><<<grd, blk>>>(       \
+            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);                   \
+    } else if (max_dim < 1024) {                                              \
+        constexpr uint32_t tile_size     = 64;                                \
+        constexpr uint32_t block_size_xy = 32;                                \
+        dim3 blk(block_size_xy * block_size_xy);                              \
+        dim3 grd((N + tile_size - 1) / tile_size,                             \
+                 (M + tile_size - 1) / tile_size);                            \
+        kernel_name<tile_size, block_size_xy, 8><<<grd, blk>>>(               \
+            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);                   \
+    } else {                                                                  \
+        constexpr uint32_t tile_size     = 128;                               \
+        constexpr uint32_t block_size_xy = 32;                                \
+        dim3 blk(block_size_xy * block_size_xy);                              \
+        dim3 grd((N + tile_size - 1) / tile_size,                             \
+                 (M + tile_size - 1) / tile_size);                            \
+        kernel_name<tile_size, block_size_xy, 8><<<grd, blk>>>(               \
+            M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);                   \
+    }                                                                         \
 }
 
 template <uint32_t tile_size = 128, uint32_t block_size_xy = 32, uint32_t step_size = 8>
@@ -293,9 +289,9 @@ __global__ void coarse_padding_tiled_gemm_kernel(
     float alpha, const float *A, int lda,
     const float *B, int ldb,
     float beta, float *C, int ldc) {
-    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+    constexpr uint32_t coarsing_factor = tile_size / block_size_xy;
     constexpr uint32_t block_size = block_size_xy * block_size_xy;
-    float C_temp[coarsing_fator][coarsing_fator] = {0};
+    float C_temp[coarsing_factor][coarsing_factor] = {0};
 
     const uint32_t steps = (K + step_size - 1) / step_size;
 
@@ -351,10 +347,10 @@ __global__ void coarse_padding_tiled_gemm_kernel(
 #pragma unroll
         for (uint32_t p = 0; p < step_size; ++p) {
 #pragma unroll
-            for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+            for (uint32_t c_i = 0; c_i < coarsing_factor; ++c_i) {
                 uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
 #pragma unroll
-                for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+                for (uint32_t c_j = 0; c_j < coarsing_factor; ++c_j) {
                     uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
 
                     C_temp[c_i][c_j] += Ads[c_row][p] * Bds[p][c_col];
@@ -366,11 +362,11 @@ __global__ void coarse_padding_tiled_gemm_kernel(
     }
 
 #pragma unroll
-    for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+    for (uint32_t c_i = 0; c_i < coarsing_factor; ++c_i) {
         uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
         uint32_t c_global_row = blockIdx.y * tile_size + c_row;
 #pragma unroll
-        for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+        for (uint32_t c_j = 0; c_j < coarsing_factor; ++c_j) {
             uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
             uint32_t c_global_col = blockIdx.x * tile_size + c_col;
 
@@ -388,11 +384,11 @@ __global__ void coarse_register_load_tiled_gemm_kernel(
     float alpha, const float *A, int lda,
     const float *B, int ldb,
     float beta, float *C, int ldc) {
-    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+    constexpr uint32_t coarsing_factor = tile_size / block_size_xy;
     constexpr uint32_t block_size = block_size_xy * block_size_xy;
-    float C_temp[coarsing_fator][coarsing_fator] = {0};
-    float tempA[coarsing_fator];
-    float tempB[coarsing_fator];
+    float C_temp[coarsing_factor][coarsing_factor] = {0};
+    float tempA[coarsing_factor];
+    float tempB[coarsing_factor];
 
     const uint32_t steps = (K + step_size - 1) / step_size;
 
@@ -453,22 +449,22 @@ __global__ void coarse_register_load_tiled_gemm_kernel(
             // 加载 A
 #pragma unroll
             for (uint32_t i = 0; i < coarsing_factor; ++i) {
-                uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
+                uint32_t c_row = i * block_size_xy + (threadIdx.x / block_size_xy);
                 tempA[i] = Ads[c_row][p];
             }
 
             // 加载 B
 #pragma unroll
             for (uint32_t i = 0; i < coarsing_factor; ++i) {
-                uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
+                uint32_t c_col = i * block_size_xy + (threadIdx.x & (block_size_xy - 1));
                 tempB[i] = Bds[p][c_col];
             }
 
 #pragma unroll
             for (uint32_t i = 0; i < coarsing_factor; ++i) {
 #pragma unroll
-                for (uint32_t j = 0; j < corarsing_factor; ++j) {
-                    C[i][j] = tempA[i] * tempB[j];
+                for (uint32_t j = 0; j < coarsing_factor; ++j) {
+                    C_temp[i][j] += tempA[i] * tempB[j];
                 }
             }
         }
@@ -477,11 +473,11 @@ __global__ void coarse_register_load_tiled_gemm_kernel(
     }
 
 #pragma unroll
-    for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+    for (uint32_t c_i = 0; c_i < coarsing_factor; ++c_i) {
         uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
         uint32_t c_global_row = blockIdx.y * tile_size + c_row;
 #pragma unroll
-        for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+        for (uint32_t c_j = 0; c_j < coarsing_factor; ++c_j) {
             uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
             uint32_t c_global_col = blockIdx.x * tile_size + c_col;
 
@@ -503,11 +499,11 @@ __global__ void coarse_warp_load_tiled_gemm_kernel(
     float alpha, const float *A, int lda,
     const float *B, int ldb,
     float beta, float *C, int ldc) {
-    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+    constexpr uint32_t coarsing_factor = tile_size / block_size_xy;
     constexpr uint32_t block_size = block_size_xy * block_size_xy;
-    float C_temp[coarsing_fator][coarsing_fator] = {0};
-    float tempA[coarsing_fator];
-    float tempB[coarsing_fator];
+    float C_temp[coarsing_factor][coarsing_factor] = {0};
+    float tempA[coarsing_factor];
+    float tempB[coarsing_factor];
 
     const uint32_t steps = (K + step_size - 1) / step_size;
 
@@ -519,7 +515,6 @@ __global__ void coarse_warp_load_tiled_gemm_kernel(
 
     uint32_t warp_id = threadIdx.x / warpSize;
     constexpr uint32_t warp_size_x = block_size_xy / 8;
-    constexpr uint32_t warp_size_y = block_size_xy / 4;
     uint32_t warp_id_y_c = warp_id / warp_size_x;
     uint32_t warp_id_x_c = warp_id % warp_size_x;
     uint32_t landId = threadIdx.x % warpSize;
@@ -597,8 +592,8 @@ __global__ void coarse_warp_load_tiled_gemm_kernel(
 #pragma unroll
             for (uint32_t i = 0; i < coarsing_factor; ++i) {
 #pragma unroll
-                for (uint32_t j = 0; j < corarsing_factor; ++j) {
-                    C[i][j] = tempA[i] * tempB[j];
+                for (uint32_t j = 0; j < coarsing_factor; ++j) {
+                    C_temp[i][j] += tempA[i] * tempB[j];
                 }
             }
         }
@@ -607,13 +602,13 @@ __global__ void coarse_warp_load_tiled_gemm_kernel(
     }
 
 #pragma unroll
-    for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+    for (uint32_t c_i = 0; c_i < coarsing_factor; ++c_i) {
         // 相对block坐标
         uint32_t c_row = c_i * block_size_xy + thread_id_y_c;
         // 相对 global 坐标
         uint32_t c_global_row = blockIdx.y * tile_size + c_row;
 #pragma unroll
-        for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+        for (uint32_t c_j = 0; c_j < coarsing_factor; ++c_j) {
             uint32_t c_col = c_j * block_size_xy + thread_id_x_c;
             uint32_t c_global_col = blockIdx.x * tile_size + c_col;
 
@@ -633,11 +628,11 @@ __global__ void coarse_float4_load_tiled_gemm_kernel(
     float alpha, const float *A, int lda,
     const float *B, int ldb,
     float beta, float *C, int ldc) {
-    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+    constexpr uint32_t coarsing_factor = tile_size / block_size_xy;
     constexpr uint32_t block_size = block_size_xy * block_size_xy;
-    float C_temp[coarsing_fator][coarsing_fator] = {0};
-    float tempA[coarsing_fator];
-    float tempB[coarsing_fator];
+    float C_temp[coarsing_factor][coarsing_factor] = {0};
+    float tempA[coarsing_factor];
+    float tempB[coarsing_factor];
 
     const uint32_t steps = (K + step_size - 1) / step_size;
 
@@ -647,7 +642,6 @@ __global__ void coarse_float4_load_tiled_gemm_kernel(
 
     uint32_t warp_id = threadIdx.x / warpSize;
     constexpr uint32_t warp_size_x = block_size_xy / 8;
-    constexpr uint32_t warp_size_y = block_size_xy / 4;
     uint32_t warp_id_y_c = warp_id / warp_size_x;
     uint32_t warp_id_x_c = warp_id % warp_size_x;
     uint32_t landId = threadIdx.x % warpSize;
@@ -729,8 +723,8 @@ __global__ void coarse_float4_load_tiled_gemm_kernel(
 #pragma unroll
             for (uint32_t i = 0; i < coarsing_factor; ++i) {
 #pragma unroll
-                for (uint32_t j = 0; j < corarsing_factor; ++j) {
-                    C[i][j] = tempA[i] * tempB[j];
+                for (uint32_t j = 0; j < coarsing_factor; ++j) {
+                    C_temp[i][j] += tempA[i] * tempB[j];
                 }
             }
         }
@@ -739,12 +733,12 @@ __global__ void coarse_float4_load_tiled_gemm_kernel(
     }
 
 #pragma unroll
-    for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+    for (uint32_t c_i = 0; c_i < coarsing_factor; ++c_i) {
         // 这个地方计算的是将tempA的坐标mapping到 tile_c中的相对坐标
         uint32_t c_row = (c_i / 4) * (4 * block_size_xy) +  thread_idx_y_c * 4 + c_i % 4;
         uint32_t c_global_row = blockIdx.y * tile_size + c_row;
 #pragma unroll
-        for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+        for (uint32_t c_j = 0; c_j < coarsing_factor; ++c_j) {
             // 这个地方计算的是在 tile_c 中的相对坐标
             uint32_t c_col = (c_j / 4) * (4 * block_size_xy) + thread_idx_x_c * 4 + c_j % 4;
             uint32_t c_global_col = blockIdx.x * tile_size + c_col;
@@ -755,5 +749,30 @@ __global__ void coarse_float4_load_tiled_gemm_kernel(
             }
         }
     }
+}
+
+// 为每个 coarse gemm kernel 实例化 launch 函数
+DEFINE_LAUNCH_COARSE_GEMM(launch_coarse_tiled_gemm, coarse_tiled_gemm_kernel)
+DEFINE_LAUNCH_COARSE_GEMM(launch_coarse_padding_tiled_gemm, coarse_padding_tiled_gemm_kernel)
+DEFINE_LAUNCH_COARSE_GEMM(launch_coarse_register_tiled_gemm, coarse_register_load_tiled_gemm_kernel)
+DEFINE_LAUNCH_COARSE_GEMM(launch_coarse_warp_tiled_gemm, coarse_warp_load_tiled_gemm_kernel)
+
+// float4 kernel 需要 coarsing_factor >= 4，只使用大 tile 配置
+inline void launch_coarse_float4_tiled_gemm(int M, int N, int K,
+                       float alpha,
+                       const float *A, int lda,
+                       const float *B, int ldb,
+                       float beta,
+                       float *C, int ldc)
+{
+    constexpr uint32_t tile_size     = 128;
+    constexpr uint32_t block_size_xy = 32;
+    constexpr uint32_t step_size     = 8;
+
+    dim3 blk(block_size_xy * block_size_xy);
+    dim3 grd((N + tile_size - 1) / tile_size,
+             (M + tile_size - 1) / tile_size);
+    coarse_float4_load_tiled_gemm_kernel<tile_size, block_size_xy, step_size><<<grd, blk>>>(
+        M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 

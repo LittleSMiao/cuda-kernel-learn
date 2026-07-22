@@ -33,9 +33,11 @@ int main() {
         // ---------- 自定义实现 ---------- //
         { "NaiveGEMM",  naive_gemm },
         { "TiledGEMM",  tiled_gemm },
-        { "CoarsingTiledGemm", launch_coarse_gemm<coarse_tiled_gemm_kernel> },
-        { "CoarsingPaddingTiledGemm", launch_coarse_gemm<coarse_padding_tiled_gemm_kernel> },
-
+        { "CoarsingTiledGemm", launch_coarse_tiled_gemm },
+        { "CoarsingPaddingTiledGemm", launch_coarse_padding_tiled_gemm },
+        { "CoarsingRegisterTiledGemm", launch_coarse_register_tiled_gemm },
+        { "CoarsingWarpReshapeTiledGemm", launch_coarse_warp_tiled_gemm },
+        { "CoarsingVecLoadTiledGemm", launch_coarse_float4_tiled_gemm },
         // 在这里添加你自己的 GEMM，例如：
         // { "MySuperGEMM", my_super_gemm },
     };
@@ -47,10 +49,6 @@ int main() {
 
     // 测试的矩阵尺寸 —— 可以根据需要自由增删
     cfg.sizes = {
-        {  128,  128,  128 },
-        {  256,  256,  256 },
-        {  512,  512,  512 },
-        { 1024, 1024, 1024 },
         { 2048, 2048, 2048 },
     };
 
