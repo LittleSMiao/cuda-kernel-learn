@@ -382,4 +382,378 @@ __global__ void coarse_padding_tiled_gemm_kernel(
     }
 }
 
+template <uint32_t tile_size = 128, uint32_t block_size_xy = 32, uint32_t step_size = 8>
+__global__ void coarse_register_load_tiled_gemm_kernel(
+    int M, int N, int K,
+    float alpha, const float *A, int lda,
+    const float *B, int ldb,
+    float beta, float *C, int ldc) {
+    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+    constexpr uint32_t block_size = block_size_xy * block_size_xy;
+    float C_temp[coarsing_fator][coarsing_fator] = {0};
+    float tempA[coarsing_fator];
+    float tempB[coarsing_fator];
+
+    const uint32_t steps = (K + step_size - 1) / step_size;
+
+    __shared__ float Ads[tile_size][step_size];
+    __shared__ float Bds[step_size][tile_size];
+
+    for (uint32_t step = 0; step < steps; ++step) {
+        // 加载 A
+        // 使用 (4, 8) 的 warp 进行加载
+        uint32_t A_start_y = blockIdx.y * tile_size;
+   
+        // 直接使用threadIdx的思维进行加载
+        // 这里的blockSize为 * 8
+        constexpr uint32_t tile_total_size = tile_size * step_size;
+        constexpr uint32_t block_size_y_tile_a = block_size / step_size;
+#pragma unroll
+        for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+            // 这个地方是相对tile的索引
+            uint32_t row = block_size_y_tile_a * b + threadIdx.x % block_size_y_tile_a;
+            uint32_t col = threadIdx.x / block_size_y_tile_a;
+
+            // 这个地方使用swizzle的影响不是那么大，因为这个地方的bankconflict跟后面的 global memory是可以相互隐藏的
+            if (row < tile_size && col < step_size) {
+                if (A_start_y + row < M && col + step * step_size < K) {
+                    Ads[row][col] = A[(A_start_y + row) + (col + step * step_size) * lda];
+                } else {
+                    Ads[row][col] = 0;
+                }
+            }
+        }
+
+        // 加载 B
+        // 使用(32, 1) 的 warp 进行加载
+        uint32_t B_start_x = blockIdx.x * tile_size;
+        constexpr uint32_t block_size_y_tile_b = step_size;
+#pragma unroll
+        for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+            // 这边也是在block中的索引，也就是在Bds中的索引
+            uint32_t row = threadIdx.x % block_size_y_tile_b;
+            uint32_t col = threadIdx.x / block_size_y_tile_b + b * (block_size / block_size_y_tile_b);
+
+            if (row < step_size && col < tile_size) {
+                if (row + step * step_size < K && col + B_start_x < N) {
+                    Bds[row][col] = B[(row + step * step_size) + (col + B_start_x) * ldb];
+                } else {
+                    Bds[row][col] = 0;
+                }
+            }
+        }
+
+        __syncthreads();
+
+#pragma unroll
+        for (uint32_t p = 0; p < step_size; ++p) {
+            // 这一步先加载到 register 里面，同时为了后续的float4优化，需要将Ads也进行加载
+            // 这一步骤可以减少从 shared memory 中的访问
+
+            // 加载 A
+#pragma unroll
+            for (uint32_t i = 0; i < coarsing_factor; ++i) {
+                uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
+                tempA[i] = Ads[c_row][p];
+            }
+
+            // 加载 B
+#pragma unroll
+            for (uint32_t i = 0; i < coarsing_factor; ++i) {
+                uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
+                tempB[i] = Bds[p][c_col];
+            }
+
+#pragma unroll
+            for (uint32_t i = 0; i < coarsing_factor; ++i) {
+#pragma unroll
+                for (uint32_t j = 0; j < corarsing_factor; ++j) {
+                    C[i][j] = tempA[i] * tempB[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+        uint32_t c_row = c_i * block_size_xy + (threadIdx.x / block_size_xy);
+        uint32_t c_global_row = blockIdx.y * tile_size + c_row;
+#pragma unroll
+        for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+            uint32_t c_col = c_j * block_size_xy + (threadIdx.x & (block_size_xy - 1));
+            uint32_t c_global_col = blockIdx.x * tile_size + c_col;
+
+            if (c_global_row < M && c_global_col < N) {
+                uint32_t idx = c_global_row + c_global_col * ldc;
+                C[idx] = alpha * C_temp[c_i][c_j] + beta * C[idx];
+            }
+        }
+    }
+}
+
+// 这个kernel调整一下再block内的warp布局(4*8，使得整个warp整体的计算密度提高)
+// 这里实际使用的blockSize为 block_size_xy * block_size_xy
+// 思想就是 block 的形状尽量贴近应用
+// warp的形状可以适当的贴近优化
+template <uint32_t tile_size = 128, uint32_t block_size_xy = 32, uint32_t step_size = 8>
+__global__ void coarse_warp_load_tiled_gemm_kernel(
+    int M, int N, int K,
+    float alpha, const float *A, int lda,
+    const float *B, int ldb,
+    float beta, float *C, int ldc) {
+    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+    constexpr uint32_t block_size = block_size_xy * block_size_xy;
+    float C_temp[coarsing_fator][coarsing_fator] = {0};
+    float tempA[coarsing_fator];
+    float tempB[coarsing_fator];
+
+    const uint32_t steps = (K + step_size - 1) / step_size;
+
+    __shared__ float Ads[tile_size][step_size];
+    __shared__ float Bds[step_size][tile_size];
+
+    // 这个地方我们最终的目的还是需要相对 block 的坐标
+    // warp坐标在当前这里只是辅助我们做计算
+
+    uint32_t warp_id = threadIdx.x / warpSize;
+    constexpr uint32_t warp_size_x = block_size_xy / 8;
+    constexpr uint32_t warp_size_y = block_size_xy / 4;
+    uint32_t warp_id_y_c = warp_id / warp_size_x;
+    uint32_t warp_id_x_c = warp_id % warp_size_x;
+    uint32_t landId = threadIdx.x % warpSize;
+
+    // 这个地方计算出来线程在 block 里的相对坐标
+    uint32_t thread_id_y_c = warp_id_y_c * 4 + landId / 8;
+    uint32_t thread_id_x_c = warp_id_x_c * 8 + landId % 8;
+
+    for (uint32_t step = 0; step < steps; ++step) {
+        // 加载 A
+        // 使用 (4, 8) 的 warp 进行加载
+        uint32_t A_start_y = blockIdx.y * tile_size;
+   
+        // 直接使用threadIdx的思维进行加载
+        // 这里的blockSize为 * 8
+        constexpr uint32_t tile_total_size = tile_size * step_size;
+        constexpr uint32_t block_size_y_tile_a = block_size / step_size;
+#pragma unroll
+        for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+            // 这个地方是相对tile的索引
+            uint32_t row = block_size_y_tile_a * b + threadIdx.x % block_size_y_tile_a;
+            uint32_t col = threadIdx.x / block_size_y_tile_a;
+
+            // 这个地方使用swizzle的影响不是那么大，因为这个地方的bankconflict跟后面的 global memory是可以相互隐藏的
+            if (row < tile_size && col < step_size) {
+                if (A_start_y + row < M && col + step * step_size < K) {
+                    Ads[row][col] = A[(A_start_y + row) + (col + step * step_size) * lda];
+                } else {
+                    Ads[row][col] = 0;
+                }
+            }
+        }
+
+        // 加载 B
+        // 使用(32, 1) 的 warp 进行加载
+        uint32_t B_start_x = blockIdx.x * tile_size;
+        constexpr uint32_t block_size_y_tile_b = step_size;
+#pragma unroll
+        for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+            // 这边也是在block中的索引，也就是在Bds中的索引
+            uint32_t row = threadIdx.x % block_size_y_tile_b;
+            uint32_t col = threadIdx.x / block_size_y_tile_b + b * (block_size / block_size_y_tile_b);
+
+            if (row < step_size && col < tile_size) {
+                if (row + step * step_size < K && col + B_start_x < N) {
+                    Bds[row][col] = B[(row + step * step_size) + (col + B_start_x) * ldb];
+                } else {
+                    Bds[row][col] = 0;
+                }
+            }
+        }
+
+        __syncthreads();
+
+#pragma unroll
+        for (uint32_t p = 0; p < step_size; ++p) {
+            // 这一步先加载到 register 里面，同时为了后续的float4优化，需要将Ads也进行加载
+            // 这一步骤可以减少从 shared memory 中的访问
+
+            // 加载 A
+#pragma unroll
+            for (uint32_t i = 0; i < coarsing_factor; ++i) {
+                // block坐标映射到tile坐标
+                uint32_t c_row = i * block_size_xy + thread_id_y_c;
+                tempA[i] = Ads[c_row][p];
+            }
+
+            // 加载 B
+#pragma unroll
+            for (uint32_t i = 0; i < coarsing_factor; ++i) {
+                uint32_t c_col = i * block_size_xy + thread_id_x_c;
+                tempB[i] = Bds[p][c_col];
+            }
+
+#pragma unroll
+            for (uint32_t i = 0; i < coarsing_factor; ++i) {
+#pragma unroll
+                for (uint32_t j = 0; j < corarsing_factor; ++j) {
+                    C[i][j] = tempA[i] * tempB[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+        // 相对block坐标
+        uint32_t c_row = c_i * block_size_xy + thread_id_y_c;
+        // 相对 global 坐标
+        uint32_t c_global_row = blockIdx.y * tile_size + c_row;
+#pragma unroll
+        for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+            uint32_t c_col = c_j * block_size_xy + thread_id_x_c;
+            uint32_t c_global_col = blockIdx.x * tile_size + c_col;
+
+            if (c_global_row < M && c_global_col < N) {
+                uint32_t idx = c_global_row + c_global_col * ldc;
+                C[idx] = alpha * C_temp[c_i][c_j] + beta * C[idx];
+            }
+        }
+    }
+}
+
+#define FLOAT4(value) (reinterpret_cast<float4*>(&(value))[0])
+
+template <uint32_t tile_size = 128, uint32_t block_size_xy = 32, uint32_t step_size = 8>
+__global__ void coarse_float4_load_tiled_gemm_kernel(
+    int M, int N, int K,
+    float alpha, const float *A, int lda,
+    const float *B, int ldb,
+    float beta, float *C, int ldc) {
+    constexpr uint32_t coarsing_fator = tile_size / block_size_xy;
+    constexpr uint32_t block_size = block_size_xy * block_size_xy;
+    float C_temp[coarsing_fator][coarsing_fator] = {0};
+    float tempA[coarsing_fator];
+    float tempB[coarsing_fator];
+
+    const uint32_t steps = (K + step_size - 1) / step_size;
+
+    // 为了使用 float4 来加载 Ads，这里使用列主序储存 Ads
+    __shared__ float Ads[step_size][tile_size];
+    __shared__ float Bds[step_size][tile_size];
+
+    uint32_t warp_id = threadIdx.x / warpSize;
+    constexpr uint32_t warp_size_x = block_size_xy / 8;
+    constexpr uint32_t warp_size_y = block_size_xy / 4;
+    uint32_t warp_id_y_c = warp_id / warp_size_x;
+    uint32_t warp_id_x_c = warp_id % warp_size_x;
+    uint32_t landId = threadIdx.x % warpSize;
+
+    // 在 mapping 之后，相对于block的坐标
+    uint32_t thread_idx_y_c = warp_id_y_c * 4 + landId / 8;
+    uint32_t thread_idx_x_c = warp_id_x_c * 8 + landId % 8;
+
+    for (uint32_t step = 0; step < steps; ++step) {
+        // 加载 A
+        // 使用 (4, 8) 的 warp 进行加载
+        uint32_t A_start_y = blockIdx.y * tile_size;
+   
+        // 直接使用threadIdx的思维进行加载
+        // 这里的blockSize为 * 8
+        constexpr uint32_t tile_total_size = tile_size * step_size;
+        constexpr uint32_t block_size_y_tile_a = block_size / step_size;
+#pragma unroll
+        for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+            // 这个地方是相对tile的索引
+            uint32_t row = block_size_y_tile_a * b + threadIdx.x % block_size_y_tile_a;
+            uint32_t col = threadIdx.x / block_size_y_tile_a;
+
+            if (row < tile_size && col < step_size) {
+                if (A_start_y + row < M && col + step * step_size < K) {
+                    Ads[col][row] = A[(A_start_y + row) + (col + step * step_size) * lda];
+                } else {
+                    Ads[col][row] = 0;
+                }
+            }
+        }
+
+        // 加载 B
+        // 使用(32, 1) 的 warp 进行加载
+        uint32_t B_start_x = blockIdx.x * tile_size;
+        constexpr uint32_t block_size_y_tile_b = step_size;
+#pragma unroll
+        for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+            // 这边也是在block中的索引，也就是在Bds中的索引
+            uint32_t row = threadIdx.x % block_size_y_tile_b;
+            uint32_t col = threadIdx.x / block_size_y_tile_b + b * (block_size / block_size_y_tile_b);
+
+            if (row < step_size && col < tile_size) {
+                if (row + step * step_size < K && col + B_start_x < N) {
+                    Bds[row][col] = B[(row + step * step_size) + (col + B_start_x) * ldb];
+                } else {
+                    Bds[row][col] = 0;
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // 这个地方使用float4 先加载到register中
+        // 因此需要调整一下数据的mapping结构
+        // 每个线程负责的单位就是一个 4 * 4 的小块了
+        static_assert(coarsing_factor >= 4);
+
+#pragma unroll
+        for (uint32_t p = 0; p < step_size; ++p) {
+            // 这一步先加载到 register 里面，同时为了后续的float4优化，需要将Ads也进行加载
+            // 这一步骤可以减少从 shared memory 中的访问
+
+            // 加载 A
+#pragma unroll
+            for (uint32_t i = 0; i < coarsing_factor / 4; ++i) {
+                // 这里计算的是让当前线程加载的那一行数据，只影响线程加载函数的排布，相邻两个加载数据其实地址的间隔是相等的
+                uint32_t c_row = (i * block_size_xy + thread_idx_y_c) * 4;
+                FLOAT4(tempA[i * 4]) = FLOAT4(Ads[p][c_row]);
+            }
+
+            // 加载 B
+#pragma unroll
+            for (uint32_t i = 0; i < coarsing_factor / 4; ++i) {
+                uint32_t c_col = (i * block_size_xy + thread_idx_x_c) * 4;
+                FLOAT4(tempB[i * 4]) = FLOAT4(Bds[p][c_col]);
+            }
+
+#pragma unroll
+            for (uint32_t i = 0; i < coarsing_factor; ++i) {
+#pragma unroll
+                for (uint32_t j = 0; j < corarsing_factor; ++j) {
+                    C[i][j] = tempA[i] * tempB[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t c_i = 0; c_i < coarsing_fator; ++c_i) {
+        // 这个地方计算的是将tempA的坐标mapping到 tile_c中的相对坐标
+        uint32_t c_row = (c_i / 4) * (4 * block_size_xy) +  thread_idx_y_c * 4 + c_i % 4;
+        uint32_t c_global_row = blockIdx.y * tile_size + c_row;
+#pragma unroll
+        for (uint32_t c_j = 0; c_j < coarsing_fator; ++c_j) {
+            // 这个地方计算的是在 tile_c 中的相对坐标
+            uint32_t c_col = (c_j / 4) * (4 * block_size_xy) + thread_idx_x_c * 4 + c_j % 4;
+            uint32_t c_global_col = blockIdx.x * tile_size + c_col;
+
+            if (c_global_row < M && c_global_col < N) {
+                uint32_t idx = c_global_row + c_global_col * ldc;
+                C[idx] = alpha * C_temp[c_i][c_j] + beta * C[idx];
+            }
+        }
+    }
+}
 
