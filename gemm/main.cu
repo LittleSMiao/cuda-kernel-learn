@@ -34,6 +34,7 @@ int main() {
         { "NaiveGEMM",  naive_gemm },
         { "TiledGEMM",  tiled_gemm },
         { "CoarsingTiledGemm", coarse_tiled_gemm },
+        { "CoarsingPaddingTiledGemm", coarse_padding_tiled_gemm },
 
         // 在这里添加你自己的 GEMM，例如：
         // { "MySuperGEMM", my_super_gemm },
