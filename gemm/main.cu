@@ -38,6 +38,7 @@ int main() {
         { "CoarsingRegisterTiledGemm", launch_coarse_register_tiled_gemm },
         { "CoarsingWarpReshapeTiledGemm", launch_coarse_warp_tiled_gemm },
         { "CoarsingVecLoadTiledGemm", launch_coarse_float4_tiled_gemm },
+        { "CoarsingVecLoadSwizzleTiledGemm", launch_coarse_float4_swizzle_tiled_gemm },
         // 在这里添加你自己的 GEMM，例如：
         // { "MySuperGEMM", my_super_gemm },
     };
