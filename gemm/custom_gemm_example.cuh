@@ -1029,13 +1029,156 @@ inline void launch_coarse_zorder_tiled_gemm(int M, int N, int K,
                        float *C, int ldc)
 {
     constexpr uint32_t tile_size     = 128;
-    constexpr uint32_t block_size_xy = 32;
+    constexpr uint32_t block_size_xy = 16;
     constexpr uint32_t step_size     = 8;
 
     dim3 blk(block_size_xy * block_size_xy);
     dim3 grd((N + tile_size - 1) / tile_size,
              (M + tile_size - 1) / tile_size);
-    coarse_float4_sizzle_load_tiled_gemm_kernel<tile_size, block_size_xy, step_size><<<grd, blk>>>(
+    coarse_zorder_tiled_gemm_kernel<tile_size, block_size_xy, step_size><<<grd, blk>>>(
         M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
 }
+
+template <uint32_t tile_size = 128, uint32_t block_size_xy = 32, uint32_t step_size = 8>
+__global__ void coarse_double_buffer_tiled_gemm_kernel(
+    int M, int N, int K,
+    float alpha, const float *A, int lda,
+    const float *B, int ldb,
+    float beta, float *C, int ldc) {
+    constexpr uint32_t coarsing_factor = tile_size / block_size_xy;
+    constexpr uint32_t block_size = block_size_xy * block_size_xy;
+    float C_temp[coarsing_factor][coarsing_factor] = {0};
+    float tempA[2][coarsing_factor];
+    float tempB[2][coarsing_factor];
+
+    const uint32_t steps = (K + step_size - 1) / step_size;
+
+    __shared__ float Ads[2][step_size][tile_size];
+    __shared__ float Bds[2][step_size][tile_size];
+
+    uint32_t warp_id = threadIdx.x / warpSize;
+    constexpr uint32_t warp_size_x = block_size_xy / 8;
+    uint32_t warp_id_y_c = warp_id / warp_size_x;
+    uint32_t warp_id_x_c = warp_id % warp_size_x;
+    uint32_t laneId = threadIdx.x % warpSize;
+
+    // 这个地方需要改变一下映射到 block中的相对索引
+    // laneid / 16 获取的室在上半个half warp 还是下半个 half warp，*2表示高度为2
+    uint32_t thread_idx_y_c = warp_id_y_c * 4 + (laneId / 16) * 2 + (laneId % 2);
+    // 保证了两个相邻的线程加载的室同一个数据，可以广播
+    // laneId%16表示在half warp的索引，然后一列两个，/2就是在x方向的索引
+    uint32_t thread_idx_x_c = warp_id_x_c * 8 + (laneId % 16) / 2;
+
+    for (uint32_t step = 0; step < steps + 1; ++step) {
+        uint32_t A_start_y = blockIdx.y * tile_size;
+   
+        if (step < steps) {
+            constexpr uint32_t tile_total_size = tile_size * step_size;
+            constexpr uint32_t block_size_y_tile_a = block_size / step_size;
+#pragma unroll
+            for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+                uint32_t row = block_size_y_tile_a * b + threadIdx.x % block_size_y_tile_a;
+                uint32_t col = threadIdx.x / block_size_y_tile_a;
+
+                if (row < tile_size && col < step_size) {
+                    if (A_start_y + row < M && col + step * step_size < K) {
+                        Ads[step & 1][col][row] = A[(A_start_y + row) + (col + step * step_size) * lda];
+                    } else {
+                        Ads[step & 1][col][row] = 0;
+                    }
+                }
+            }
+
+            uint32_t B_start_x = blockIdx.x * tile_size;
+            constexpr uint32_t block_size_y_tile_b = step_size;
+#pragma unroll
+            for (uint32_t b = 0; b < (tile_total_size + block_size - 1) / block_size; ++b) {
+                uint32_t row = threadIdx.x % block_size_y_tile_b;
+                uint32_t col = threadIdx.x / block_size_y_tile_b + b * (block_size / block_size_y_tile_b);
+
+                if (row < step_size && col < tile_size) {
+                    if (row + step * step_size < K && col + B_start_x < N) {
+                        Bds[step & 1][row][col ^ (row << 4)] = B[(row + step * step_size) + (col + B_start_x) * ldb];
+                    } else {
+                        Bds[step & 1][row][col ^ (row << 4)] = 0;
+                    }
+                }
+            }
+        }
+
+        if (step > 0) {
+#pragma unroll
+            for (uint32_t p = 0; p < step_size + 1; ++p) {
+                if (p < step_size) {
+#pragma unroll
+                    for (uint32_t i = 0; i < coarsing_factor / 4; ++i) {
+                        // 这里考虑的是相邻thread
+                        // 在加载A的时候，基于以上我们的分析，使用的warpsize是4*8，正好每一行代表的是一个quater warp
+                        // 对于每个quater warp，加载的都是同一个float4，触发了广播
+                        // 因此这里需要两个 transaction
+                        uint32_t c_row = (i * block_size_xy + thread_idx_y_c) * 4;
+                        FLOAT4(tempA[p & 1][i * 4]) = FLOAT4(Ads[(step + 1) & 1][p][c_row]);
+                    }
+
+#pragma unroll
+                    for (uint32_t i = 0; i < coarsing_factor / 4; ++i) {
+                        // 在改动前，每个相邻的thread访问的向量是并列的
+                        // 导致需要4个transaction
+                        uint32_t c_col = (i * block_size_xy + thread_idx_x_c) * 4;
+                        FLOAT4(tempB[p & 1][i * 4]) = FLOAT4(Bds[(step + 1) & 1][p][c_col ^ (p << 4)]);
+                    }
+                }
+
+                if (p > 0) {
+#pragma unroll
+                    for (uint32_t i = 0; i < coarsing_factor; ++i) {
+#pragma unroll
+                        for (uint32_t j = 0; j < coarsing_factor; ++j) {
+                            C_temp[i][j] += tempA[(p + 1) & 1][i] * tempB[(p + 1) & 1][j];
+                        }
+                    }
+                }
+            }
+
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t c_i = 0; c_i < coarsing_factor; ++c_i) {
+        uint32_t c_row = (c_i / 4) * (4 * block_size_xy) +  thread_idx_y_c * 4 + c_i % 4;
+        uint32_t c_global_row = blockIdx.y * tile_size + c_row;
+#pragma unroll
+        for (uint32_t c_j = 0; c_j < coarsing_factor; ++c_j) {
+            uint32_t c_col = (c_j / 4) * (4 * block_size_xy) + thread_idx_x_c * 4 + c_j % 4;
+            uint32_t c_global_col = blockIdx.x * tile_size + c_col;
+
+            if (c_global_row < M && c_global_col < N) {
+                uint32_t idx = c_global_row + c_global_col * ldc;
+                C[idx] = alpha * C_temp[c_i][c_j] + beta * C[idx];
+            }
+        }
+    }
+}
+
+inline void launch_coarse_double_buffer_tiled_gemm(int M, int N, int K,
+                       float alpha,
+                       const float *A, int lda,
+                       const float *B, int ldb,
+                       float beta,
+                       float *C, int ldc)
+{
+    constexpr uint32_t tile_size     = 128;
+    constexpr uint32_t block_size_xy = 16;
+    constexpr uint32_t step_size     = 8;
+
+    dim3 blk(block_size_xy * block_size_xy);
+    dim3 grd((N + tile_size - 1) / tile_size,
+             (M + tile_size - 1) / tile_size);
+    coarse_double_buffer_tiled_gemm_kernel<tile_size, block_size_xy, step_size><<<grd, blk>>>(
+        M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+}
+
+
 
